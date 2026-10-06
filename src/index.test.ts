@@ -9,8 +9,8 @@ import {
   generateFallbackTitle,
   findCheapestFromModels,
   loadConfig,
-  extractSessionId,
-  extractMessageContent,
+  titleContext,
+  AutoTitle,
   CHEAP_MODEL_PATTERNS,
 } from "./index"
 
@@ -449,104 +449,146 @@ describe("loadConfig", () => {
   })
 })
 
-describe("extractSessionId", () => {
-  it("extracts sessionID from properties", () => {
-    const event = { properties: { sessionID: "session-123" } }
-    expect(extractSessionId(event)).toBe("session-123")
-  })
-
-  it("extracts session.id from properties", () => {
-    const event = { properties: { session: { id: "session-456" } } }
-    expect(extractSessionId(event)).toBe("session-456")
-  })
-
-  it("extracts info.id from properties", () => {
-    const event = { properties: { info: { id: "session-789" } } }
-    expect(extractSessionId(event)).toBe("session-789")
-  })
-
-  it("extracts sessionID from root", () => {
-    const event = { sessionID: "session-root" }
-    expect(extractSessionId(event)).toBe("session-root")
-  })
-
-  it("extracts session.id from root", () => {
-    const event = { session: { id: "session-root-nested" } }
-    expect(extractSessionId(event)).toBe("session-root-nested")
-  })
-
-  it("returns null for missing sessionId", () => {
-    const event = { type: "test" }
-    expect(extractSessionId(event)).toBeNull()
-  })
-
-  it("returns null for null event", () => {
-    expect(extractSessionId(null)).toBeNull()
-  })
-
-  it("returns null for undefined event", () => {
-    expect(extractSessionId(undefined)).toBeNull()
+describe("V2 title context", () => {
+  it("reads text parts and ignores non-text parts", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "Fix login" }, { type: "image" }] },
+      { role: "assistant", content: [{ type: "text", text: "Updated auth flow" }] },
+    ]
+    expect(titleContext(messages)).toEqual({ user: "Fix login", assistant: "Updated auth flow" })
   })
 })
 
-describe("extractMessageContent", () => {
-  it("extracts content string from user message", () => {
-    const event = {
-      properties: {
-        messages: [{ role: "user", content: "Hello world" }],
+describe("V2 title hook", () => {
+  const originalEnv = process.env
+  afterEach(() => { process.env = originalEnv })
+
+  function createContext(initialTitle: string | undefined, response: string | Error = "Fix Login Flow") {
+    let title = initialTitle
+    let hook: ((event: any) => Promise<void>) | undefined
+    const dispose = vi.fn()
+    const ctx = {
+      session: {
+        hook: vi.fn(async (_name: string, callback: (event: any) => Promise<void>) => {
+          hook = callback
+          return { dispose }
+        }),
+        get: vi.fn(async () => ({ title })),
       },
+      model: { list: vi.fn(async () => ({ data: [{ providerID: "demo", id: "fast-model", name: "Fast Model" }] })) },
+      generate: { text: vi.fn(async () => {
+        if (response instanceof Error) throw response
+        return { text: response }
+      }) },
     }
-    expect(extractMessageContent(event)).toBe("Hello world")
-  })
-
-  it("extracts text string from user message", () => {
     const event = {
-      properties: {
-        messages: [{ role: "user", text: "Hello text" }],
-      },
+      sessionID: "fake-session",
+      model: { providerID: "demo", id: "default" },
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Please fix the login flow" }] },
+        { role: "assistant", content: [{ type: "text", text: "Updated authentication" }] },
+      ],
+      result: undefined as string | undefined,
     }
-    expect(extractMessageContent(event)).toBe("Hello text")
+    return { ctx, event, dispose, invoke: async () => { await hook?.(event) }, setTitle: (next: string) => { title = next } }
+  }
+
+  it("generates one AI title with selected fast model and disposes hook", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_MODEL: "", OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("New Session")
+    const cleanup = await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.ctx.session.hook).toHaveBeenCalledWith("title", expect.any(Function))
+    expect(fixture.ctx.generate.text).toHaveBeenCalledWith(expect.objectContaining({ model: { providerID: "demo", id: "fast-model" } }))
+    expect(fixture.event.result).toBe("✨ Fix Login Flow")
+    await cleanup?.()
+    expect(fixture.dispose).toHaveBeenCalledOnce()
   })
 
-  it("extracts text from parts array", () => {
-    const event = {
-      properties: {
-        messages: [
-          {
-            role: "user",
-            parts: [{ type: "text", text: "Hello parts" }],
-          },
-        ],
-      },
-    }
-    expect(extractMessageContent(event)).toBe("Hello parts")
+  it("preserves a custom title set while generation is running", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("New Session")
+    fixture.ctx.generate.text.mockImplementation(async () => {
+      fixture.setTitle("My Own Title")
+      return { text: "Generated Title" }
+    })
+    await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.event.result).toBe("My Own Title")
   })
 
-  it("handles info.role format", () => {
-    const event = {
-      properties: {
-        messages: [{ info: { role: "user" }, content: "Hello info" }],
-      },
-    }
-    expect(extractMessageContent(event)).toBe("Hello info")
+  it("preserves a title already provided by another hook", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("New Session")
+    fixture.event.result = "Another Hook Title"
+    await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.event.result).toBe("Another Hook Title")
+    expect(fixture.ctx.session.get).not.toHaveBeenCalled()
+    expect(fixture.ctx.generate.text).not.toHaveBeenCalled()
   })
 
-  it("returns null for empty messages", () => {
-    const event = { properties: { messages: [] } }
-    expect(extractMessageContent(event)).toBeNull()
+  it("uses keyword fallback on generation failure without creating a session", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("New Session", new Error("offline"))
+    await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.event.result).toMatch(/^🔍 /)
+    expect(fixture.ctx.session).not.toHaveProperty("create")
   })
 
-  it("returns null for assistant-only messages", () => {
-    const event = {
-      properties: {
-        messages: [{ role: "assistant", content: "I am assistant" }],
-      },
-    }
-    expect(extractMessageContent(event)).toBeNull()
+  it("does not replace an existing custom title", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("User Title")
+    await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.event.result).toBe("User Title")
+    expect(fixture.ctx.generate.text).not.toHaveBeenCalled()
   })
 
-  it("returns null for null event", () => {
-    expect(extractMessageContent(null)).toBeNull()
+  it("honors an explicitly configured model", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_MODEL: "chosen/model-v2", OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("New Session")
+    await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.ctx.generate.text).toHaveBeenCalledWith(expect.objectContaining({ model: { providerID: "chosen", id: "model-v2" } }))
+  })
+
+  it("prefers Luna over a frontier fast model in automatic selection", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_MODEL: "", OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("New Session")
+    fixture.ctx.model.list.mockResolvedValue({ data: [
+      { providerID: "openai", id: "gpt-6-astra-fast", name: "GPT Astra Fast" },
+      { providerID: "openai", id: "gpt-5.6-luna", name: "GPT Luna" },
+    ] })
+    await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.ctx.generate.text).toHaveBeenCalledWith(expect.objectContaining({ model: { providerID: "openai", id: "gpt-5.6-luna" } }))
+  })
+
+  it("uses keyword fallback when only a frontier model is available", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_MODEL: "", OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("New Session")
+    fixture.ctx.model.list.mockResolvedValue({ data: [{ providerID: "openai", id: "gpt-6-astra-fast", name: "GPT Astra Fast" }] })
+    await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.ctx.generate.text).not.toHaveBeenCalled()
+    expect(fixture.event.result).toMatch(/^🔍 /)
+  })
+
+  it("preserves an explicitly selected reasoning variant", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_MODEL: "openai/gpt-5.6-luna#low", OPENCODE_AUTOTITLE_DISABLED: "" }
+    const fixture = createContext("New Session")
+    await AutoTitle.setup(fixture.ctx as any)
+    await fixture.invoke()
+    expect(fixture.ctx.generate.text).toHaveBeenCalledWith(expect.objectContaining({ model: { providerID: "openai", id: "gpt-5.6-luna", variant: "low" } }))
+  })
+
+  it("does not register a hook when disabled", async () => {
+    process.env = { ...originalEnv, OPENCODE_AUTOTITLE_DISABLED: "true" }
+    const fixture = createContext("New Session")
+    await AutoTitle.setup(fixture.ctx as any)
+    expect(fixture.ctx.session.hook).not.toHaveBeenCalled()
   })
 })
 

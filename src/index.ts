@@ -1,9 +1,6 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import fs from "node:fs"
 import path from "node:path"
-
-// Log immediately when module is loaded (helps debug if plugin is being loaded at all)
-console.error("[autotitle] Module loaded")
 
 // Emoji prefixes for titles
 const EMOJI_KEYWORD = "🔍"  // Used for quick keyword-based titles
@@ -17,16 +14,10 @@ interface PluginConfig {
   debug: boolean | string  // true, false, or path to log file
 }
 
-interface State {
-  keywordTitledSessions: Set<string>  // Sessions with keyword title (waiting for AI)
-  aiTitledSessions: Set<string>       // Sessions with final AI title
-  pendingAISessions: Set<string>      // Sessions currently generating AI title
-  cheapestModel: { providerID: string; modelID: string } | null | undefined
-}
-
 // Known cheap/fast model patterns - ordered by preference
 // Priority: fast (often free) > flash (very cheap) > haiku (cheap) > other cheap patterns
 const CHEAP_MODEL_PATTERNS = [
+  /luna/i,
   /fast/i,      // Grok Code Fast, etc. (often free)
   /flash/i,     // Gemini Flash (very cheap)
   /haiku/i,     // Claude Haiku (cheap)
@@ -73,6 +64,7 @@ function findCheapestFromModels(models: any, log: ReturnType<typeof createLogger
 function loadConfig(): PluginConfig {
   const env = process.env
   const debugEnv = env.OPENCODE_AUTOTITLE_DEBUG
+  const requestedLength = Number(env.OPENCODE_AUTOTITLE_MAX_LENGTH)
   
   // Debug can be: "1", "true" (enable stderr), or a file path
   let debug: boolean | string = false
@@ -88,151 +80,32 @@ function loadConfig(): PluginConfig {
   return {
     model: env.OPENCODE_AUTOTITLE_MODEL || null,
     provider: env.OPENCODE_AUTOTITLE_PROVIDER || null,
-    maxLength: Number(env.OPENCODE_AUTOTITLE_MAX_LENGTH) || 60,
+    maxLength: Number.isInteger(requestedLength) && requestedLength >= 4 ? requestedLength : 60,
     disabled: env.OPENCODE_AUTOTITLE_DISABLED === "1" || env.OPENCODE_AUTOTITLE_DISABLED === "true",
     debug,
   }
 }
 
-function createLogger(debug: boolean | string, client?: any) {
-  const isEnabled = !!debug
+function createLogger(debug: boolean | string) {
   const logFile = typeof debug === "string" ? debug : null
-  
-  // If logging to file, resolve path and ensure directory exists
   let logPath: string | null = null
   if (logFile) {
-    logPath = path.isAbsolute(logFile) ? logFile : path.resolve(process.cwd(), logFile)
     try {
-      const dir = path.dirname(logPath)
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true })
-      }
-      // Clear log file on startup
-      fs.writeFileSync(logPath, `[autotitle] Log started at ${new Date().toISOString()}\n`)
+      logPath = path.isAbsolute(logFile) ? logFile : path.resolve(process.cwd(), logFile)
+      fs.mkdirSync(path.dirname(logPath), { recursive: true })
     } catch {
-      // Fall back to stderr if file creation fails
       logPath = null
     }
   }
-  
-  const log = (level: string, msg: string) => {
-    // Only show debug and info when debug mode is enabled
-    if ((level === "debug" || level === "info") && !isEnabled) return
-    
-    const timestamp = new Date().toISOString()
-    const line = `[autotitle] ${timestamp} ${level.toUpperCase()}: ${msg}`
-    
+  const write = (level: "debug" | "error", message: string) => {
+    if (level === "debug" && !debug) return
+    const line = `[autotitle] ${new Date().toISOString()} ${level.toUpperCase()}: ${message}\n`
     if (logPath) {
-      // Append to log file
-      try {
-        fs.appendFileSync(logPath, line + "\n")
-      } catch {
-        // Fallback to stderr
-        console.error(line)
-      }
-    } else if (isEnabled || level === "error") {
-      // Log to stderr
-      console.error(line)
+      try { fs.appendFileSync(logPath, line); return } catch { /* stderr fallback */ }
     }
-    
-    // Also use client.app.log if available
-    if (client?.app?.log) {
-      client.app.log({
-        body: {
-          service: "autotitle",
-          level: level as "debug" | "info" | "warn" | "error",
-          message: msg,
-        },
-      }).catch(() => {})
-    }
+    console.error(line.trimEnd())
   }
-  
-  return {
-    debug: (msg: string) => log("debug", msg),
-    info: (msg: string) => log("info", msg),
-    error: (msg: string) => log("error", msg),
-  }
-}
-
-async function findCheapestModel(
-  client: any,
-  config: PluginConfig,
-  log: ReturnType<typeof createLogger>
-): Promise<{ providerID: string; modelID: string } | null> {
-  // If explicit model is set, use it
-  if (config.model) {
-    const [providerID, modelID] = config.model.includes("/")
-      ? config.model.split("/", 2)
-      : ["anthropic", config.model]
-    log.debug(`Using configured model: ${providerID}/${modelID}`)
-    return { providerID, modelID }
-  }
-
-  try {
-    // First, get connected providers to prefer currently logged-in provider
-    let connectedProviderIds: string[] = []
-    try {
-      const providerResponse = await client.provider.list() as any
-      const providerData = providerResponse?.data || providerResponse
-      connectedProviderIds = providerData?.connected || []
-      log.debug(`Connected providers: ${connectedProviderIds.join(", ") || "none"}`)
-    } catch (e) {
-      log.debug(`Failed to fetch connected providers: ${e instanceof Error ? e.message : "unknown"}`)
-    }
-
-    const providersResponse = await client.config.providers() as any
-    const responseData = providersResponse?.data || providersResponse
-    const providers = responseData?.providers || []
-    
-    log.debug(`Found ${providers.length} providers`)
-    
-    // Debug: log provider structure
-    if (providers.length > 0) {
-      log.debug(`First provider keys: ${JSON.stringify(Object.keys(providers[0]))}`)
-      log.debug(`First provider: ${JSON.stringify(providers[0]).slice(0, 500)}`)
-    }
-    
-    // If a specific provider is requested, use it
-    if (config.provider) {
-      const provider = providers.find((p: any) => p.id === config.provider)
-      if (provider) {
-        const models = provider.models || []
-        const cheapModel = findCheapestFromModels(models, log)
-        if (cheapModel) {
-          return { providerID: config.provider, modelID: cheapModel }
-        }
-      }
-    }
-    
-    // Prioritize connected (logged-in) providers first
-    // This respects the user's current provider choice and avoids unnecessary provider switching
-    const connectedProviders = providers.filter((p: any) => connectedProviderIds.includes(p.id))
-    const otherProviders = providers.filter((p: any) => !connectedProviderIds.includes(p.id))
-    const sortedProviders = [...connectedProviders, ...otherProviders]
-    
-    if (connectedProviders.length > 0) {
-      log.debug(`Prioritizing ${connectedProviders.length} connected provider(s): ${connectedProviders.map((p: any) => p.id).join(", ")}`)
-    }
-    
-    // Find cheapest model, preferring connected providers
-    for (const provider of sortedProviders) {
-      const providerID = provider.id
-      if (!providerID) continue
-      
-      const models = provider.models || []
-      const cheapModel = findCheapestFromModels(models, log)
-      if (cheapModel) {
-        log.debug(`Selected ${providerID}/${cheapModel}`)
-        return { providerID, modelID: cheapModel }
-      }
-    }
-    
-    log.debug("No models found in any provider")
-  } catch (e) {
-    log.debug(`Failed to fetch providers: ${e instanceof Error ? e.message : "unknown"}`)
-  }
-
-  return null
+  return { debug: (message: string) => write("debug", message), error: (message: string) => write("error", message) }
 }
 
 function isTimestampTitle(title: string | undefined): boolean {
@@ -373,150 +246,31 @@ function generateFallbackTitle(text: string, maxLength: number): string {
   return sanitizeTitle(title, maxLength)
 }
 
-async function generateAITitle(
-  client: any,
-  sessionId: string,
-  userMessage: string,
-  assistantMessage: string | null,
-  modelToUse: { providerID: string; modelID: string } | null,
-  config: PluginConfig,
-  log: ReturnType<typeof createLogger>
-): Promise<string | null> {
-  // Build context from both user question and assistant response
-  let context = `User asked: "${userMessage.slice(0, 300)}"`
-  if (assistantMessage) {
-    context += `\n\nAssistant responded: "${assistantMessage.slice(0, 400)}"`
-  }
-  
-  const prompt = `Generate a concise, specific title (3-6 words) for this conversation:
-
-${context}
-
-Rules:
-- MUST NOT exceed ${config.maxLength} characters - this is a hard limit
-- No quotes or special punctuation (but keep dots in filenames like AGENTS.md, package.json)
-- Use title case
-- Be SPECIFIC about the actual content discussed (e.g., "British Shorthair Cat Photo" not "Image Identification")
-- If the response mentions specific things (names, technologies, animals, etc.), include them
-- If there's a ticket/issue reference (JIRA like ABC-123, GitHub PR #123, Trello, Linear, etc.), include it as a prefix (e.g., "ABC-123 Fix Login Bug")
-- Return ONLY the title, nothing else`
-
-  let tempSessionId: string | null = null
-  
-  try {
-    log.debug("Creating temp session for AI title generation")
-    
-    // Create temp session using the correct SDK pattern
-    const tempSession = await client.session.create({
-      body: { title: "autotitle-temp" }
-    }) as any
-    tempSessionId = tempSession?.id || tempSession?.data?.id
-    
-    if (!tempSessionId) {
-      log.debug(`Failed to create temp session: ${JSON.stringify(tempSession).slice(0, 200)}`)
-      return null
-    }
-    
-    log.debug(`Created temp session ${tempSessionId}, sending prompt`)
-    
-    // Build model config from the resolved model
-    const bodyConfig: any = {
-      parts: [{ type: "text", text: prompt }],
-    }
-    if (modelToUse) {
-      bodyConfig.model = modelToUse
-      log.debug(`Using model: ${modelToUse.providerID}/${modelToUse.modelID}`)
-    }
-    
-    // Use session.prompt which returns AssistantMessage with AI response
-    const response = await client.session.prompt({
-      path: { id: tempSessionId },
-      body: bodyConfig,
-    }) as any
-    
-    log.debug(`Prompt response: ${JSON.stringify(response).slice(0, 300)}`)
-    
-    // Extract text from response parts
-    const parts = response?.parts || response?.data?.parts || []
-    for (const part of parts) {
-      if (part?.type === "text" && part?.text) {
-        const responseText = part.text.trim()
-        log.debug(`Got AI text: "${responseText.slice(0, 100)}"`)
-        
-        // Take first line as title
-        const lines = responseText.split("\n").filter((l: string) => l.trim())
-        const titleCandidate = lines[0] || responseText
-        
-        if (titleCandidate.length > 0 && titleCandidate.length <= config.maxLength + 20) {
-          const title = sanitizeTitle(titleCandidate, config.maxLength)
-          log.debug(`AI generated title: "${title}"`)
-          
-          // Cleanup temp session
-          await client.session.delete({ path: { id: tempSessionId } }).catch(() => {})
-          return title
-        }
-      }
-    }
-    
-    // Also try response.content pattern
-    if (response?.content) {
-      const title = sanitizeTitle(response.content, config.maxLength)
-      log.debug(`AI generated title (content): "${title}"`)
-      await client.session.delete({ path: { id: tempSessionId } }).catch(() => {})
-      return title
-    }
-    
-    log.debug("No valid title in AI response")
-  } catch (e) {
-    log.debug(`AI generation failed: ${e instanceof Error ? e.message : "unknown"}`)
-  } finally {
-    // Always try to cleanup temp session
-    if (tempSessionId) {
-      await client.session.delete({ path: { id: tempSessionId } }).catch(() => {})
-    }
-  }
-
-  return null
+// The V2 title hook receives AI SDK messages with text parts.
+function titleContext(messages: ReadonlyArray<{ role: string; content: ReadonlyArray<{ type: string; text?: string | null }> }>): { user: string; assistant: string } {
+  const text = (role: "user" | "assistant") => messages
+    .filter(message => message.role === role)
+    .flatMap(message => message.content)
+    .filter(part => part.type === "text")
+    .map(part => part.text ?? "")
+    .join(" ")
+  return { user: text("user").slice(0, 300), assistant: text("assistant").slice(0, 400) }
 }
 
-// Extract session ID from various event structures
-function extractSessionId(event: any): string | null {
-  // Try various paths where session ID might be
-  return (
-    event?.properties?.sessionID ||
-    event?.properties?.session?.id ||
-    event?.properties?.info?.id ||
-    event?.sessionID ||
-    event?.session?.id ||
-    null
-  )
+function modelRef(value: string, provider: string): { providerID: string; id: string; variant?: string } {
+  const variantStart = value.indexOf("#")
+  const base = variantStart < 0 ? value : value.slice(0, variantStart)
+  const separator = base.indexOf("/")
+  const reference = separator < 0
+    ? { providerID: provider, id: base }
+    : { providerID: base.slice(0, separator), id: base.slice(separator + 1) }
+  return variantStart < 0 ? reference : { ...reference, variant: value.slice(variantStart + 1) }
 }
 
-// Extract user message content from event
-function extractMessageContent(event: any): string | null {
-  // Try to get content from event properties
-  const messages = event?.properties?.messages || event?.messages || []
-  
-  for (const msg of messages) {
-    if (msg?.role === "user" || msg?.info?.role === "user") {
-      // Try different content locations
-      if (typeof msg.content === "string") return msg.content
-      if (typeof msg.text === "string") return msg.text
-      
-      // Check parts array
-      const parts = msg.parts || []
-      for (const part of parts) {
-        if (part?.type === "text" && part?.text) {
-          return part.text
-        }
-      }
-    }
-  }
-  
-  return null
+function automaticCandidate(model: { id: string; name: string; enabled?: boolean }): boolean {
+  return model.enabled !== false && !/astra|fable|kimi[-_ ]?k3|qwen[-_ ]?max/i.test(`${model.id} ${model.name}`)
 }
 
-// Export pure functions for testing
 export {
   isTimestampTitle,
   hasPluginEmoji,
@@ -527,241 +281,73 @@ export {
   generateFallbackTitle,
   findCheapestFromModels,
   loadConfig,
-  extractSessionId,
-  extractMessageContent,
+  titleContext,
   CHEAP_MODEL_PATTERNS,
 }
 
-export const AutoTitle: Plugin = async ({ client }) => {
-  const config = loadConfig()
-  const log = createLogger(config.debug, client)
-
-  if (config.disabled) {
-    log.info("Plugin is disabled via OPENCODE_AUTOTITLE_DISABLED")
-    return {}
-  }
-
-  const state: State = {
-    keywordTitledSessions: new Set(),
-    aiTitledSessions: new Set(),
-    pendingAISessions: new Set(),
-    cheapestModel: null,
-  }
-
-  log.info("AutoTitle plugin initialized")
-
-  // Helper to update session title
-  async function updateTitle(sessionId: string, title: string): Promise<boolean> {
-    try {
-      await client.session.update({
-        path: { id: sessionId },
-        body: { title },
-      })
-      log.debug(`Updated session ${sessionId} title to: ${title}`)
-      return true
-    } catch (err) {
-      log.error(`Failed to update session title: ${err instanceof Error ? err.message : "unknown"}`)
-      return false
-    }
-  }
-
-  // Helper to get current session title
-  async function getSessionTitle(sessionId: string): Promise<string | undefined> {
-    try {
-      const response = await client.session.get({ path: { id: sessionId } }) as any
-      const sessionData = response?.data || response
-      return sessionData?.title
-    } catch {
-      return undefined
-    }
-  }
-
-  // Helper to get session messages
-  async function getSessionMessages(sessionId: string): Promise<{ user: string | null; assistant: string | null }> {
-    try {
-      const response = await client.session.messages({ path: { id: sessionId } }) as any
-      const messages = response?.data || response || []
-      
-      let user: string | null = null
-      let assistant: string | null = null
-      
-      for (const msg of messages) {
-        const role = msg?.info?.role || msg?.role
-        const parts = msg?.parts || []
-        
-        for (const part of parts) {
-          if (part?.type === "text" && part?.text) {
-            if (role === "user" && !user) {
-              user = part.text
-            } else if (role === "assistant" && !assistant) {
-              assistant = part.text
+export const AutoTitle = Plugin.define({
+  id: "autotitle",
+  async setup(ctx) {
+    const config = loadConfig()
+    if (config.disabled) return
+    const log = createLogger(config.debug)
+    const pending = new Map<string, Promise<string | undefined>>()
+    const registration = await ctx.session.hook("title", async event => {
+      if (event.result !== undefined) return
+      const id = event.sessionID
+      let task = pending.get(id)
+      if (!task) {
+        task = (async (): Promise<string | undefined> => {
+          try {
+            const session = await ctx.session.get({ sessionID: id })
+            if (!shouldModifyTitle(session.title)) return session.title
+            const { user, assistant } = titleContext(event.messages)
+            if (!user) return undefined
+            const fallback = generateFallbackTitle(user, Math.max(1, config.maxLength - 3))
+            const fallbackTitle = fallback ? `${EMOJI_KEYWORD} ${fallback}` : undefined
+            try {
+              const available = (await ctx.model.list()).data
+              const requested = config.model ? modelRef(config.model, config.provider ?? event.model.providerID) : null
+              const eligible = available.filter(automaticCandidate)
+              const candidates = config.provider
+                ? eligible.filter(model => model.providerID === config.provider)
+                : eligible
+              const preferred = requested ?? (() => {
+                for (const pattern of CHEAP_MODEL_PATTERNS) {
+                  const match = candidates.find(model => pattern.test(model.id) || pattern.test(model.name))
+                  if (match) return { providerID: match.providerID, id: match.id }
+                }
+                const fallbackModel = candidates.find(model => model.providerID === event.model.providerID && model.id === event.model.id) ?? candidates[0]
+                if (!fallbackModel) throw new Error("No eligible automatic title model")
+                return { providerID: fallbackModel.providerID, id: fallbackModel.id }
+              })()
+              const prompt = `Generate a concise, specific title (3-6 words, at most ${Math.max(1, config.maxLength - 2)} characters) for this conversation. Return only the title, without emoji, quotes or punctuation. Keep filenames and issue references.\nUser: ${user}\nAssistant: ${assistant}`
+              const response = await ctx.generate.text({ model: preferred, prompt })
+              const firstLine = response.text.split(/\r?\n/).find(line => line.trim()) ?? ""
+              const generated = sanitizeTitle(firstLine, Math.max(1, config.maxLength - 2))
+              const latest = await ctx.session.get({ sessionID: id })
+              if (!shouldModifyTitle(latest.title)) return latest.title
+              return generated ? `${EMOJI_AI} ${generated}` : fallbackTitle
+            } catch {
+              log.debug("AI title unavailable; using keyword fallback")
+              const latest = await ctx.session.get({ sessionID: id })
+              return shouldModifyTitle(latest.title) ? fallbackTitle : latest.title
             }
-            break
+          } catch {
+            log.error("Title hook failed")
+            return undefined
           }
-        }
-        
-        if (user && assistant) break
+        })()
+        pending.set(id, task)
       }
-      
-      return { user, assistant }
-    } catch {
-      return { user: null, assistant: null }
-    }
-  }
-
-  // Phase 1: Quick keyword-based title on user message
-  async function handleUserMessage(sessionId: string, userText: string) {
-    // Skip if already processed
-    if (state.keywordTitledSessions.has(sessionId) || state.aiTitledSessions.has(sessionId)) {
-      return
-    }
-
-    // Check current title
-    const currentTitle = await getSessionTitle(sessionId)
-    
-    // Don't modify custom user titles (titles without our emoji that aren't default)
-    if (!shouldModifyTitle(currentTitle)) {
-      log.debug(`Session ${sessionId} has custom title, skipping: ${currentTitle}`)
-      state.aiTitledSessions.add(sessionId)  // Mark as done
-      return
-    }
-
-    // Generate keyword-based title
-    const keywordTitle = generateFallbackTitle(userText, config.maxLength - 2)  // -2 for emoji + space
-    if (!keywordTitle) {
-      log.debug(`Could not generate keyword title for session ${sessionId}`)
-      return
-    }
-
-    const fullTitle = `${EMOJI_KEYWORD} ${keywordTitle}`
-    if (await updateTitle(sessionId, fullTitle)) {
-      log.info(`Set keyword title: ${fullTitle}`)
-      state.keywordTitledSessions.add(sessionId)
-    }
-  }
-
-  // Phase 2: AI-generated title after response
-  async function handleSessionIdle(sessionId: string) {
-    // Skip if already has AI title
-    if (state.aiTitledSessions.has(sessionId)) {
-      return
-    }
-
-    // Skip if currently processing
-    if (state.pendingAISessions.has(sessionId)) {
-      return
-    }
-
-    // Check current title
-    const currentTitle = await getSessionTitle(sessionId)
-    
-    // Don't modify custom user titles
-    if (!shouldModifyTitle(currentTitle)) {
-      log.debug(`Session ${sessionId} has custom title, skipping AI: ${currentTitle}`)
-      state.aiTitledSessions.add(sessionId)
-      return
-    }
-
-    state.pendingAISessions.add(sessionId)
-
-    try {
-      // Get messages for context
-      const { user: userMessage, assistant: assistantMessage } = await getSessionMessages(sessionId)
-      
-      if (!userMessage) {
-        log.debug(`No user message found for session ${sessionId}`)
-        return
+      try {
+        event.result = await task
+      } finally {
+        if (pending.get(id) === task) pending.delete(id)
       }
-
-      log.debug(`Generating AI title for session ${sessionId}`)
-      log.debug(`User: ${userMessage.slice(0, 100)}...`)
-      if (assistantMessage) {
-        log.debug(`Assistant: ${assistantMessage.slice(0, 100)}...`)
-      }
-
-      // Lazily find cheapest model
-      if (state.cheapestModel === null) {
-        try {
-          const found = await findCheapestModel(client, config, log)
-          state.cheapestModel = found ?? undefined
-          if (state.cheapestModel) {
-            log.debug(`Selected model: ${state.cheapestModel.providerID}/${state.cheapestModel.modelID}`)
-          }
-        } catch (e) {
-          log.debug(`Failed to find cheap model: ${e instanceof Error ? e.message : "unknown"}`)
-          state.cheapestModel = undefined
-        }
-      }
-
-      // Generate AI title
-      const aiTitle = await generateAITitle(
-        client, sessionId, userMessage, assistantMessage,
-        state.cheapestModel ?? null, config, log
-      )
-
-      if (aiTitle) {
-        const fullTitle = `${EMOJI_AI} ${aiTitle}`
-        if (await updateTitle(sessionId, fullTitle)) {
-          log.info(`Set AI title: ${fullTitle}`)
-          state.aiTitledSessions.add(sessionId)
-          state.keywordTitledSessions.delete(sessionId)  // Clean up
-        }
-      } else {
-        log.debug(`AI title generation failed for session ${sessionId}`)
-        // Keep the keyword title if we have one
-        if (state.keywordTitledSessions.has(sessionId)) {
-          state.aiTitledSessions.add(sessionId)  // Mark as done (keep keyword title)
-        }
-      }
-    } catch (err) {
-      log.error(`Failed to generate AI title: ${err instanceof Error ? err.message : "unknown"}`)
-    } finally {
-      state.pendingAISessions.delete(sessionId)
-    }
-  }
-
-  return {
-    event: async ({ event }: { event: unknown }) => {
-      const e = event as any
-      
-      if (config.debug) {
-        log.debug(`Event: ${e?.type} - ${JSON.stringify(e).slice(0, 500)}`)
-      }
-
-      // Phase 1: On user message, set quick keyword title
-      if (e?.type === "message.part.updated") {
-        const part = e?.properties?.part
-        const sessionId = part?.sessionID
-        
-        // Check if this is a user message text part
-        if (sessionId && part?.type === "text" && part?.text) {
-          // We need to check if this is from a user message
-          // The part doesn't directly tell us the role, so we check if we've seen this session
-          if (!state.keywordTitledSessions.has(sessionId) && !state.aiTitledSessions.has(sessionId)) {
-            // Get the message to check its role
-            const messageId = part?.messageID
-            if (messageId) {
-              // For now, trigger on first text we see for a new session
-              // The session.idle will refine it later
-              handleUserMessage(sessionId, part.text).catch(err => {
-                log.debug(`Error in handleUserMessage: ${err instanceof Error ? err.message : "unknown"}`)
-              })
-            }
-          }
-        }
-      }
-
-      // Phase 2: On session idle (after AI responds), generate AI title
-      if (e?.type === "session.idle") {
-        const sessionId = extractSessionId(e)
-        if (sessionId) {
-          handleSessionIdle(sessionId).catch(err => {
-            log.debug(`Error in handleSessionIdle: ${err instanceof Error ? err.message : "unknown"}`)
-          })
-        }
-      }
-    },
-  }
-}
+    })
+    return () => registration.dispose()
+  },
+})
 
 export default AutoTitle
