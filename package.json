@@ -6,22 +6,22 @@
   "types": "dist/index.d.ts",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage",
+    "test": "vitest run src",
+    "test:watch": "vitest src",
+    "test:coverage": "vitest run src --coverage",
     "prepublishOnly": "npm run build"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pawelma/opencode-autotitle.git"
+    "url": "git+https://github.com/TheViniAlmeida/opencode-autotitle.git"
   },
   "bugs": {
-    "url": "https://github.com/pawelma/opencode-autotitle/issues"
+    "url": "https://github.com/TheViniAlmeida/opencode-autotitle/issues"
   },
-  "homepage": "https://github.com/pawelma/opencode-autotitle#readme",
+  "homepage": "https://github.com/TheViniAlmeida/opencode-autotitle#readme",
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -43,20 +43,30 @@
   "author": "Pawel Madejski",
   "license": "MIT",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.19.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.0.0",
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0",
     "vitest": "^4.0.18"
   },
-  "peerDependencies": {
-    "bun": ">=1.0.0"
-  },
   "files": [
-    "dist",
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/index.d.ts",
+    "dist/index.d.ts.map",
+    "server.js",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./server.js"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.22"
+  },
+  "overrides": {
+    "picomatch@>=4.0.0 <4.0.4": "4.0.4"
+  }
 }

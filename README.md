@@ -1,217 +1,46 @@
 # opencode-autotitle
 
-[![CI](https://github.com/pawelma/opencode-autotitle/actions/workflows/ci.yml/badge.svg)](https://github.com/pawelma/opencode-autotitle/actions/workflows/ci.yml)
-[![Publish to npm](https://github.com/pawelma/opencode-autotitle/actions/workflows/publish.yml/badge.svg)](https://github.com/pawelma/opencode-autotitle/actions/workflows/publish.yml)
-[![npm version](https://img.shields.io/npm/v/opencode-autotitle.svg)](https://www.npmjs.com/package/opencode-autotitle)
+Automatic, concise titles for [OpenCode V2](https://opencode.ai/v2/docs/build/plugins). This fork is based on the original plugin by Pawel Madejski (MIT license).
 
-AI-powered automatic session naming for [OpenCode](https://opencode.ai).
-
-Automatically generates descriptive titles for your OpenCode sessions based on conversation context, replacing generic timestamp-based names like "2024-01-15 14:30" with meaningful descriptions like "Setup React Auth Flow".
-
-## From Timestamp Chaos to Meaningful Titles
-
-| Before | After |
-|--------|-------|
-| ![Before - Timestamp titles](docs/images/before.png) | ![After - Auto-generated titles](docs/images/after.png) |
-
-## Features
-
-- **Two-phase titling**: Instant keyword title on user message, refined AI title after response
-- **AI-powered**: Auto-selects cheapest available model (flash/haiku/fast) for title generation
-- **Instant feedback**: Keyword-based title appears immediately, no waiting for AI
-- **Zero configuration**: Works out of the box with sensible defaults
-- **Non-blocking**: Runs in the background, never slows your workflow
-- **Respects custom titles**: Won't overwrite manually set session names
+OpenCode's `session.title` hook invokes this plugin when a title is being generated. It reads the conversation, selects a fast available model, and calls V2's transient `generate.text` API. Successful AI titles start with `✨`; if generation fails, a keyword title starts with `🔍`. Existing user titles are preserved. The plugin does not create temporary sessions or add messages to conversation history.
 
 ## Installation
 
-### Quick Install (Recommended)
-
-**Option 1: Let your AI agent install it**
-
-Paste this into OpenCode, Claude Code, Cursor, or any AI coding assistant:
-
-```
-Install opencode-autotitle by following the instructions here:
-https://raw.githubusercontent.com/pawelma/opencode-autotitle/refs/heads/master/docs/install.md
-```
-
-**Option 2: One-liner**
+Requires OpenCode V2 and Node.js 18 or newer. From this checkout:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pawelma/opencode-autotitle/refs/heads/master/install.sh | bash
+npm ci --ignore-scripts
+npm run build
 ```
 
-### Manual Installation
+Add the checkout directory to `plugins` in your OpenCode `opencode.json` or `opencode.jsonc`:
 
-OpenCode loads plugin **files** directly from `~/.config/opencode/plugins/`.
-
-```bash
-# Clone, build, and copy the plugin file
-tmp_dir=$(mktemp -d)
-git clone --depth 1 https://github.com/pawelma/opencode-autotitle "$tmp_dir"
-cd "$tmp_dir" && npm install && npm run build
-mkdir -p ~/.config/opencode/plugins
-cp dist/index.js ~/.config/opencode/plugins/opencode-autotitle.js
-rm -rf "$tmp_dir"
+```jsonc
+{
+  "plugins": ["/absolute/path/to/opencode-autotitle"]
+}
 ```
 
-## How It Works
-
-The plugin uses a **two-phase approach** for instant feedback with quality refinement:
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         OPENCODE SESSION                                │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  PHASE 1: Quick Title (on message.part.updated)                         │
-│  ───────────────────────────────────────────────────────────────────────│
-│                                                                         │
-│   User types message ──► Extract keywords ──► Set title immediately     │
-│                                                                         │
-│   "Help me set up JWT auth"  ──►  "🔍 Jwt Auth Express"                 │
-│                                                                         │
-│   • No API call needed                                                  │
-│   • Instant title update                                                │
-│   • Uses keyword extraction + stop word filtering                       │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  PHASE 2: AI Title (on session.idle)                                    │
-│  ───────────────────────────────────────────────────────────────────────│
-│                                                                         │
-│   AI responds ──► Find cheap model ──► Generate title ──► Update        │
-│                                                                         │
-│   Context: user question + AI response                                  │
-│                                                                         │
-│   "🔍 Jwt Auth Express"  ──►  "✨ Setup JWT Auth Express"               │
-│                                                                         │
-│   • Uses cheapest available model (flash/haiku/fast)                    │
-│   • Creates temp session for title generation                           │
-│   • More specific title based on actual conversation                    │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  RESULT                                                                 │
-│  ───────────────────────────────────────────────────────────────────────│
-│                                                                         │
-│   🔍 = Keyword-based title (fast fallback)                              │
-│   ✨ = AI-generated title (final quality)                               │
-│                                                                         │
-│   Custom user titles are never overwritten                              │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### State Management
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                      Plugin State                            │
-├──────────────────────────────────────────────────────────────┤
-│  keywordTitledSessions: Set<string>   ← Has 🔍 title         │
-│  aiTitledSessions: Set<string>        ← Has ✨ title (done)  │
-│  pendingAISessions: Set<string>       ← Currently processing │
-│  cheapestModel: cached model choice   ← Lazily discovered    │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### Title Generation
-
-Phase 1 sets a quick keyword title, Phase 2 refines it with AI:
-
-| User Message | Generated Title |
-|--------------|-----------------|
-| "Help me set up authentication with JWT in my Express app" | "Setup JWT Auth Express" |
-| "There's a bug in the login form, it's not validating emails" | "Fix Login Email Validation" |
-| "Can you refactor the database queries to use connection pooling?" | "Refactor Database Pooling" |
-| "Write tests for the payment processing module" | "Testing Payment Module" |
+OpenCode's local directory loader resolves `server.js`, which reexports `dist/index.js`. Keep both the root file and `dist/` when moving the built plugin. The package also exports `./server` for direct imports.
 
 ## Configuration
 
-All configuration is optional. The plugin works out of the box.
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `OPENCODE_AUTOTITLE_MODEL` | Auto-select a fast model | Model ID, optionally `provider/model` |
+| `OPENCODE_AUTOTITLE_PROVIDER` | Any available provider | Restrict auto-selection to one provider |
+| `OPENCODE_AUTOTITLE_MAX_LENGTH` | `60` | Maximum title length including emoji |
+| `OPENCODE_AUTOTITLE_DISABLED` | `false` | Set to `1` or `true` to disable |
+| `OPENCODE_AUTOTITLE_DEBUG` | `false` | Set to `1`/`true` for stderr, or a file path |
 
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENCODE_AUTOTITLE_MODEL` | (auto) | Model ID like `anthropic/claude-haiku-4-5` |
-| `OPENCODE_AUTOTITLE_MAX_LENGTH` | `60` | Maximum title character length |
-| `OPENCODE_AUTOTITLE_DISABLED` | `false` | Set to `1` to disable the plugin |
-| `OPENCODE_AUTOTITLE_DEBUG` | `false` | File path for debug logs (e.g., `debug.log`) |
-
-### Model Selection
-
-By default, the plugin auto-discovers the cheapest available model from your connected providers, preferring models with names like `fast`, `flash`, `haiku`, or `mini`. To use a specific model:
-
-```bash
-export OPENCODE_AUTOTITLE_MODEL="anthropic/claude-haiku-4-5"
-```
-
-## Debugging
-
-Enable debug mode to see what's happening:
-
-```bash
-export OPENCODE_AUTOTITLE_DEBUG=debug.log
-opencode
-# In another terminal: tail -f debug.log
-```
-
-Look for `[autotitle]` messages in the output.
+If no fast model is available, the session's current title model is used. The configured model takes precedence over provider auto-selection. Generation errors fall back to a keyword title. Debug logs do not include message text or model responses.
 
 ## Development
 
 ```bash
-# Clone the repository
-git clone https://github.com/pawelma/opencode-autotitle
-cd opencode-autotitle
-
-# Install dependencies
-npm install          # or: bun install
-
-# Build
-npm run build
-
-# Watch mode
-npm run dev
-
-# Type check
 npm run typecheck
-
-# Run tests
 npm test
-
-# Run tests in watch mode
-npm run test:watch
+npm run build
 ```
 
-## Inspirations
-
-This project was inspired by and builds upon ideas from:
-
-- **[oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode)** - The comprehensive OpenCode enhancement suite that pioneered the agent-assisted installation pattern and demonstrated what's possible with OpenCode plugins. The installation documentation approach used here is directly inspired by their excellent developer experience.
-
-- **[opencode-zellij-namer](https://github.com/24601/opencode-zellij-namer)** - AI-powered Zellij session naming plugin that showed how to elegantly combine AI generation with fallback heuristics for naming. The signal collection and intent inference patterns in this plugin were influenced by their implementation.
-
-Thank you to the maintainers and contributors of these projects for sharing their work with the community.
-
-## License
-
-MIT - see [LICENSE](LICENSE)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-> **Note:** Currently tested with the GitHub Copilot provider only.
+The plugin targets `@opencode/plugin` 2.0.22. See [V2 plugin documentation](https://opencode.ai/v2/docs/build/plugins) for the hook lifecycle.
